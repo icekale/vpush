@@ -3233,7 +3233,7 @@ class DB:
         )
 
     def delete_news_source(self, source_id: int) -> dict | None:
-        """硬删除媒体并级联清除其文章、用户订阅与全部 Feed；调用方须先归档。"""
+        """硬删除媒体并级联清除其文章、用户订阅与全部 Feed。"""
         with self._lock:
             try:
                 self._conn.execute("BEGIN")

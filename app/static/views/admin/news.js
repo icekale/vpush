@@ -100,7 +100,8 @@ export function createAdminNewsView(dependencies) {
               <button type="button" class="btn-ghost danger" onclick="deleteAdminNewsSource(${selected.id})">彻底删除</button>` : `
               <button type="button" class="btn-ghost" onclick="openNewsSourceModal(${selected.id})">编辑媒体</button>
               <button type="button" class="btn-ghost" onclick="toggleAdminNewsSource(${selected.id}, ${selected.enabled ? "false" : "true"})">${selected.enabled ? "停用采集" : "启用采集"}</button>
-              <button type="button" class="btn-ghost danger" onclick="archiveAdminNewsSource(${selected.id})">归档</button>`}
+              <button type="button" class="btn-ghost danger" onclick="archiveAdminNewsSource(${selected.id})">归档</button>
+              <button type="button" class="btn-ghost danger" onclick="deleteAdminNewsSource(${selected.id})">彻底删除</button>`}
           </div>
         </header>
         <div class="news-admin-metrics">
