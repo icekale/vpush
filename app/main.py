@@ -351,7 +351,7 @@ def create_app(config=None, db_path: str | Path | None = None) -> FastAPI:
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob: https:; "
             "connect-src 'self' https://challenges.cloudflare.com; "
-            "frame-src https://challenges.cloudflare.com; "
+            "frame-src 'self' blob: https://challenges.cloudflare.com; "
             "worker-src 'self'; "
             "manifest-src 'self'; "
             "base-uri 'self'; "
