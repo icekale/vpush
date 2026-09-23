@@ -3528,18 +3528,20 @@ function cookieRepairItems(s) {
   const twReason = src.twitter?.direct_fallback_reason || src.twitter?.last_error || "";
   // 双通道：错误消息带通道标识（X GraphQL(app) / X GraphQL(cookie)），据此分辨到底
   // 是哪条通道失效后再提示——两条通道的凭证与续期方式完全不同，混在一起会指错方向。
+  //
+  // 判据只能用 HTTP 状态码与鉴权关键词：通道标识本身含 "app"/"cookie" 字样，
+  // 把它们当特征词会恒真（曾因此把 429 限流误报成「X Cookie 可能失效」）。
+  // 429（限流）也不提示：通道级失败转移 + 平台退避会自愈，提示只会让人误以为要换 Cookie。
+  const xCredBad =
+    /HTTP (401|403)|unauthorized|forbidden|could not authenticate|code (89|32)\b/i.test(twReason);
   const xAppReady = !!(twCh.app_ready || twCh.mode === "app_only" || twCh.mode === "split");
-  if (hasTw && src.twitter?.direct_mode === "fallback") {
-    if (/GraphQL\(app\)/i.test(twReason) && /401|403|89|32|invalid|cookie/i.test(twReason)) {
+  if (hasTw && src.twitter?.direct_mode === "fallback" && xCredBad) {
+    if (/GraphQL\(app\)/i.test(twReason)) {
       items.push({ key: "x-app-bad", label: "X App 通道凭证可能失效" });
-    } else if (
-      /GraphQL\(cookie\)/i.test(twReason) &&
-      /401|403|89|32|未配置|cookie/i.test(twReason)
-    ) {
+    } else if (/GraphQL\(cookie\)/i.test(twReason)) {
       items.push({ key: "x-bad", label: "X Cookie 可能失效" });
-    } else if (!/GraphQL\((app|cookie)\)/i.test(twReason) && /cookie|401|403|89|32|未配置|twitter/i.test(twReason)) {
-      // 旧格式消息（无通道标识）或平台级错误：保留原有提示但不再断言是 Cookie
-      items.push({ key: "x-bad", label: "X 抓取异常，检查凭证与限流" });
+    } else {
+      items.push({ key: "x-bad", label: "X 抓取异常，检查凭证" });
     }
   }
   if (hasTw && !tw.set && !xAppReady) {
