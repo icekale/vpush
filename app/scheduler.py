@@ -1800,12 +1800,30 @@ def _alert_cookie_keepalive(db: DB, notifiers: list[Notifier], label: str, detai
     if last and now - int(last) < SOURCE_ALERT_INTERVAL:
         return
     db.set_setting(COOKIE_KEEPALIVE_ALERT_KEY, str(now))
-    message = (
-        f"⚠️ {label} cookie 保活失败：会话可能已过期或登录态被清除。"
-        f"请到后台「数据源 → Cookie 管理」更新 {label} Cookie。"
-        f"{'微博可扫码续期。' if label == '微博' else ''}"
-        + (f" 详情：{detail[:120]}" if detail else "")
-    )
+    if label == "微博":
+        # 区分两种失效：App 身份续期本身失效（需重新提取凭证）vs 普通 cookie 失效
+        app_err_at = db.get_setting("weibo_app_cred_last_error_at") or ""
+        if app_err_at:
+            app_err = (db.get_setting("weibo_app_cred_last_error") or "")[:120]
+            message = (
+                "⚠️ 微博 App 身份续期失效 —— 需要重新提取 App 凭证。"
+                "vpush 已无法用 gsid/s 自动换取 cookie（本次已回退密码登录/扫码路径）。"
+                "处理方式：在真机重新提取 gsid/aid/s（含 device 参数），写入 settings.weibo_app_cred。"
+                + (f" 最近错误：{app_err}" if app_err else "")
+                + (f" 详情：{detail[:120]}" if detail else "")
+            )
+        else:
+            message = (
+                f"⚠️ {label} cookie 保活失败：会话可能已过期或登录态被清除。"
+                f"请到后台「数据源 → Cookie 管理」更新 {label} Cookie。微博可扫码续期。"
+                + (f" 详情：{detail[:120]}" if detail else "")
+            )
+    else:
+        message = (
+            f"⚠️ {label} cookie 保活失败：会话可能已过期或登录态被清除。"
+            f"请到后台「数据源 → Cookie 管理」更新 {label} Cookie。"
+            + (f" 详情：{detail[:120]}" if detail else "")
+        )
     _send_admin_text(notifiers, message, "cookie 保活告警")
 
 
@@ -1934,8 +1952,17 @@ def keepalive_weibo_cookie(db: DB, notifiers: list[Notifier], weibo_config, clie
                 db.set_setting(WEIBO_COOKIE_TIME_KEY, str(int(time.time())))
                 db.set_setting(SOURCE_ERR_KEY.format(platform="weibo"), "")
             return
-        # 会话已失效：有账号密码则自动登录续期，否则告警
+        # 会话已失效：优先用 App 身份续期（无风控、全自动、无需人工扫码）
         db.set_setting(SOURCE_ERR_KEY.format(platform="weibo"), "保活：会话已失效")
+        try:
+            if WeiboFetcher(weibo_config, db, client=client)._refresh_via_app():
+                db.set_setting(WEIBO_COOKIE_TIME_KEY, str(int(time.time())))
+                db.set_setting(SOURCE_ERR_KEY.format(platform="weibo"), "")
+                logger.info("微博 cookie 保活：已通过 App 身份自动续期（无需密码/扫码）")
+                return
+        except Exception:  # noqa: BLE001
+            logger.exception("微博保活：App 身份续期异常，回退到密码登录")
+        # 回退：有账号密码则自动登录续期，否则发二维码
         if weibo_config.username and weibo_config.password:
             try:
                 fetcher = WeiboFetcher(weibo_config, db, client=client)

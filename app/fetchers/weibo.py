@@ -37,6 +37,22 @@ LOGIN_URL = "https://login.sina.com.cn/sso/login.php"
 # 桌面端 AJAX 接口，配合 weibo.com 域会话 cookie（扫码登录得到的会话即可用）
 TIMELINE_URL = "https://weibo.com/ajax/statuses/mymblog"
 
+# App 身份续期：POST /2/account/getcookie 换取 web cookie。
+# 相比 _login()（账号密码 + RSA），这是正常 App 行为，不触发登录风控，也无需人工扫码。
+GETCOOKIE_URL = "https://api.weibo.cn/2/account/getcookie"
+WEIBO_APP_CRED_KEY = "weibo_app_cred"  # settings 中的 JSON: {uid, gsid, aid, s}
+# 下列常量取自真机 hook 到的真实 App 请求（见 wb/hook_request.js）
+# 客户端常量：所有微博客户端一致，与设备/账号无关
+APP_COMMON = {
+    "c": "android", "wb_version": "8173", "from": "10G9295010",
+    "wm": "4260_0001", "oldwm": "4260_0001",
+    "v_f": "2", "v_p": "93", "ft": "0", "skin": "default",
+    "dlang": "zh-Hans-CN", "networktype": "wifi", "lang": "zh_CN",
+}
+# 注：设备指纹（ua / android_id）不写死在代码里，一律由 weibo_app_cred.device 提供，
+#     以免设备信息进入版本库。用 wb/extract_app_cred.sh 提取时会自动带上。
+APP_UA = "Weibo/8350 (Android 14; zh_CN; 23127PN0CC; 2.0.4; sdk=34)"
+
 
 def weibo_session_dead(resp: httpx.Response) -> bool:
     """登录失效：passport / 401/403/302 / JSON 要求登录，或 AJAX 返回了 HTML。"""
@@ -253,6 +269,91 @@ class WeiboFetcher(Fetcher):
             raise RuntimeError(f"微博预登录失败（可能被限流）: {data}")
         return data
 
+    def _note_app_cred_error(self, msg: str) -> None:
+        """记录 App 凭证异常，供 scheduler 告警区分「凭证失效」与「cookie 失效」。"""
+        try:
+            self.db.set_setting("weibo_app_cred_last_error_at", str(int(time.time())))
+            self.db.set_setting("weibo_app_cred_last_error", msg[:300])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_via_app(self) -> bool:
+        """用 App 身份（gsid + s）换 web cookie —— 不走密码，不触发登录风控。
+
+        优先于 _login() 调用；失败时由调用方回退到密码登录。
+        凭证存 settings[WEIBO_APP_CRED_KEY]，JSON 形如 {uid,gsid,aid,s}。
+        """
+        raw = self.db.get_setting(WEIBO_APP_CRED_KEY)
+        if not raw:
+            return False
+        try:
+            cred = json.loads(raw)
+            # 设备参数优先取凭证自带的（换采集账号时随凭证一起更新），
+            # 缺失才回退到代码默认值 —— 避免 gsid 与设备参数来自不同设备而触发风控
+            params = dict(APP_COMMON)
+            params.update(cred.get("device") or {})
+            missing = [k for k in ("ua", "android_id") if not params.get(k)]
+            if missing:
+                logger.warning(
+                    "App 凭证缺少设备参数 %s —— 请用 wb/extract_app_cred.sh 重新提取",
+                    ",".join(missing),
+                )
+                self._note_app_cred_error(f"凭证缺少设备参数: {','.join(missing)}")
+                return False
+            params.update({
+                "s": cred["s"], "gsid": cred["gsid"], "aid": cred["aid"],
+                "ul_ctime": str(int(time.time() * 1000)), "getcookie": "1",
+            })
+            # 直连 api.weibo.cn（实测洛杉矶机房可直连，无需代理）
+            resp = httpx.post(
+                GETCOOKIE_URL,
+                data=params,
+                timeout=20,
+                headers={
+                    "User-Agent": APP_UA,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Cookie": "gsid_CTandWM=" + cred["gsid"],
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw_cookie = (data.get("cookie") or {}).get(".weibo.com")
+            if not raw_cookie:
+                # 凭证失效常表现为 HTTP 200 + 错误 body（如 errno=-100 要求重新登录），
+                # 不走 except 分支，因此必须在这里也记录，否则告警无法区分类型
+                logger.warning("getcookie 未返回 .weibo.com cookie: %s", str(data)[:200])
+                self._note_app_cred_error(f"getcookie 返回空: {str(data)[:150]}")
+                return False
+            fresh = {}
+            for seg in raw_cookie.split(";"):
+                seg = seg.strip()
+                if "=" in seg:
+                    k, v = seg.split("=", 1)
+                    if k in ("SUB", "SUBP", "SCF"):
+                        fresh[k] = v
+            if "SUB" not in fresh:
+                logger.warning("getcookie 返回的 cookie 缺少 SUB")
+                return False
+            # 合并而非替换：保留原 cookie 的其它字段，只覆盖 SUB/SUBP/SCF，
+            # 避免因服务端返回字段不全而丢掉仍在使用的 cookie
+            merged = {}
+            for seg in (self.db.get_setting(WEIBO_COOKIE_KEY) or "").split(";"):
+                seg = seg.strip()
+                if "=" in seg:
+                    k, v = seg.split("=", 1)
+                    merged[k] = v
+            merged.update(fresh)
+            self.db.set_setting(WEIBO_COOKIE_KEY, "; ".join(f"{k}={v}" for k, v in merged.items()))
+            # 成功即清空错误标记，避免陈旧告警
+            self.db.set_setting("weibo_app_cred_last_error_at", "")
+            self.db.set_setting("weibo_app_cred_last_error", "")
+            logger.info("微博 cookie 已通过 App 身份自动续期（无需密码/扫码）")
+            return True
+        except Exception as exc:
+            self._note_app_cred_error(str(exc))
+            logger.exception("App 身份续期失败，将回退到密码登录")
+            return False
+
     def _login(self) -> None:
         """weibo.cn passport 登录：拿 SUB 等 cookie 并持久化。
 
@@ -344,7 +445,9 @@ class WeiboFetcher(Fetcher):
             if resp.status_code == 432:
                 raise RuntimeError("微博反爬拦截（HTTP 432），请检查 cookie/账号配置或降低抓取频率后重试")
             if weibo_session_dead(resp):
-                self._login()
+                # 优先 App 身份续期（无风控、全自动）；失败才回退密码登录
+                if not self._refresh_via_app():
+                    self._login()
                 self._apply_cookie()
                 resp = self.client.get(TIMELINE_URL, params=params)
             resp.raise_for_status()
