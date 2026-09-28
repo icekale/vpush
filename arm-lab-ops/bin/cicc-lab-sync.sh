@@ -24,6 +24,14 @@ fi
 umask 077
 mkdir -p "${LOG_DIR}"
 
+# Create the log up front and grant read to the vpush-rust container user
+# (ro mount /app/cicc-lab-logs). Non-fatal; set CICC_LOG_READER_UID= to skip.
+CICC_LOG_READER_UID="${CICC_LOG_READER_UID:-10001}"
+: >>"${LOG}"
+if [[ -n "${CICC_LOG_READER_UID}" ]] && command -v setfacl >/dev/null 2>&1; then
+  setfacl -m "u:${CICC_LOG_READER_UID}:r,m::r" "${LOG}" 2>/dev/null || true
+fi
+
 if [[ ! -f "$SCRIPT" ]]; then
   echo "cicc_report_collector.py missing at $SCRIPT" >&2
   exit 2
