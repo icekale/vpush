@@ -27,6 +27,8 @@
     熔断 paused.json 写在 $CACHE_ROOT/.cicc/ 或 $VPUSH_ARM_STAGING_ROOT/.cicc/
     （不在 ARM 上 mkdir /srv/vpush-ima）
     不直写 NFS / 115 / OpenList；上传只走 puller
+    puller 入库后会清掉 staging，所以下载前另查 $CACHE_ROOT/manifest/lab.sqlite
+    （只读）：报告 id 已是 uploaded/hot 就跳过，不再每天把 --days 窗口整段重下
 
 目录契约见 docs/superpowers/specs/2026-08-29-local-storage-library-mount-design.md
 与 docs/arm-middleware.md。
@@ -40,6 +42,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -391,6 +394,48 @@ def arm_relpath(pdf_path: Path) -> str:
     if "local" in parts:
         return "/".join(parts[parts.index("local"):])
     return pdf_path.name
+
+
+LAB_DONE_STATUSES = ("uploaded", "hot")
+_RID_IN_NAME = re.compile(r"_(\d+)\.pdf$")
+
+
+def lab_sqlite_path() -> Path:
+    """puller 的 lab.sqlite；VPUSH_LAB_SQLITE 可覆盖，否则 $CACHE_ROOT/manifest/lab.sqlite。"""
+    override = os.environ.get("VPUSH_LAB_SQLITE", "").strip()
+    if override:
+        return Path(override)
+    root = os.environ.get("CACHE_ROOT", "").strip() or "/data/vpush-ima-cache"
+    return Path(root) / "manifest" / "lab.sqlite"
+
+
+def load_ingested_ids(db: Path) -> set[str] | None:
+    """只读查 lab.sqlite，返回已入库（uploaded/hot）的中金报告 id。
+
+    按文件名里的 _<id>.pdf 认，不按整条路径：标题改字或日期分片变了也算同一篇。
+    同一篇每次下载 sha1 都不同（尺寸一样），puller 按 sha1 认不出重复，只能在这里挡。
+    库不存在或读失败返回 None：照旧全下，不因为清单坏了漏采。"""
+    if not db.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+        try:
+            marks = ",".join("?" * len(LAB_DONE_STATUSES))
+            rows = conn.execute(
+                f"SELECT rel_path FROM files WHERE rel_path LIKE ? AND status IN ({marks})",
+                (f"local/{LIB_SLUG}/%", *LAB_DONE_STATUSES),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        print(f"warning: 读不到 {db}（{e}），本轮不跳过已入库", file=sys.stderr)
+        return None
+    ids = set()
+    for (rel,) in rows:
+        m = _RID_IN_NAME.search(rel or "")
+        if m:
+            ids.add(m.group(1))
+    return ids
 
 
 def write_arm_item_sidecar(pdf_path: Path, row: dict, cat_name: str = "") -> None:
@@ -891,9 +936,10 @@ def main() -> None:
     end = date.today().strftime("%Y-%m-%d")
     start = args.since or ((date.today() - timedelta(days=args.days - 1)).strftime("%Y-%m-%d") if args.days else None)
 
-    stats = {"downloaded": 0, "skipped": 0, "failed": 0}
+    stats = {"downloaded": 0, "skipped": 0, "failed": 0, "ingested": 0}
     stop = False
-    # 幂等只靠磁盘文件名（含报告 id，唯一）；无 state 文件，多进程并行无竞态
+    # 幂等靠磁盘文件名（含报告 id，唯一）；中间层另查 lab.sqlite 已入库 id（只读）
+    ingested_ids = load_ingested_ids(lab_sqlite_path()) if middleware else None
 
     if not middleware:
         setup_library(root, LIB_SLUG, LIB_NAME, fix_owner=fix_owner)
@@ -939,6 +985,10 @@ def main() -> None:
                         write_arm_item_sidecar(tp, row, name)
                     stats["skipped"] += 1
                     continue
+                if ingested_ids is not None and str(rid) in ingested_ids:
+                    stats["skipped"] += 1  # 计入「已存在跳过」，汇总行格式不变
+                    stats["ingested"] += 1
+                    continue
                 if args.dry_run:
                     print(f"  DRY {tp.relative_to(root)}")
                     continue
@@ -969,6 +1019,8 @@ def main() -> None:
         print(f"[{name}] 列出 {total_seen} 篇" + ("（中止）" if stop else ""))
 
     flush_sidecar()
+    if ingested_ids is not None:
+        print(f"lab.sqlite 已入库跳过 {stats['ingested']}（已入库 id {len(ingested_ids)} 个）")
     print(f"完成：下载 {stats['downloaded']}，已存在跳过 {stats['skipped']}，失败 {stats['failed']}")
     if stats["failed"]:
         sys.exit(1)
