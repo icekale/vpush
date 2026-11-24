@@ -211,6 +211,8 @@ def test_collector_middleware_writes_date_shard_and_json(tmp_path, monkeypatch):
     cookie.write_text("offline-fixture")
     staging = tmp_path / "staging"
     monkeypatch.delenv("VPUSH_ARM_MIDDLEWARE", raising=False)
+    monkeypatch.delenv("VPUSH_LAB_SQLITE", raising=False)
+    monkeypatch.setenv("CACHE_ROOT", str(tmp_path / "cache"))  # 没有 lab.sqlite：照旧全下
     monkeypatch.setattr(sys, "argv", [
         "collector", "--arm-middleware", "--cookie-file", str(cookie),
         "--root", str(staging), "--keywords", "match",
@@ -244,6 +246,80 @@ def test_collector_middleware_writes_date_shard_and_json(tmp_path, monkeypatch):
     assert chowns == []
     classic = staging / "cicc-research" / "宏观经济" / "0801" / "match 标题_42.pdf"
     assert not classic.exists()
+
+
+def _lab_sqlite(path: Path, rows: list[tuple[str, str]]) -> None:
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, rel_path TEXT NOT NULL UNIQUE,"
+                 " status TEXT NOT NULL)")
+    conn.executemany("INSERT INTO files (rel_path, status) VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+
+def test_load_ingested_ids_reads_done_cicc_rows_only(tmp_path):
+    m = cicc_report_collector
+    db = tmp_path / "lab.sqlite"
+    _lab_sqlite(db, [
+        ("local/cicc-research/2026/11/22/图说大宗_405662.pdf", "hot"),
+        ("local/cicc-research/2026/11/21/老标题_405600.pdf", "uploaded"),
+        ("local/cicc-research/2026/11/23/上传失败_405700.pdf", "failed"),
+        ("local/cicc-research/2026/11/23/还在暂存_405701.pdf", "staging"),
+        ("local/ima-reports/2026/11/23/别的库_405702.pdf", "hot"),
+    ])
+    assert m.load_ingested_ids(db) == {"405662", "405600"}
+    assert m.load_ingested_ids(tmp_path / "missing.sqlite") is None
+    broken = tmp_path / "broken.sqlite"
+    broken.write_bytes(b"not a database")
+    assert m.load_ingested_ids(broken) is None
+
+
+def test_collector_middleware_skips_ids_already_in_lab_sqlite(tmp_path, monkeypatch, capsys):
+    import sys
+
+    m = cicc_report_collector
+    cookie = tmp_path / "fixture-cookie.txt"
+    cookie.write_text("offline-fixture")
+    staging = tmp_path / "staging"
+    db = tmp_path / "lab.sqlite"
+    # 42 已入库（标题和日期分片都和这次列表不同，也要认出来）；43 上传失败，要重下
+    _lab_sqlite(db, [("local/cicc-research/2026/07/31/旧标题_42.pdf", "hot"),
+                     ("local/cicc-research/2026/08/01/match 二_43.pdf", "failed")])
+    monkeypatch.delenv("VPUSH_ARM_MIDDLEWARE", raising=False)
+    monkeypatch.setenv("VPUSH_LAB_SQLITE", str(db))
+    monkeypatch.setattr(sys, "argv", [
+        "collector", "--arm-middleware", "--cookie-file", str(cookie), "--root", str(staging),
+    ])
+    monkeypatch.setattr(m, "Session", lambda _: object())
+    monkeypatch.setattr(m, "PAUSED_FILE", str(tmp_path / "paused.json"))
+    monkeypatch.setattr(m, "fetch_param", lambda _: {"treeData": [{"id": 1, "name": "宏观经济"}]})
+    monkeypatch.setattr(m.time, "sleep", lambda _: None)
+    monkeypatch.setattr(m, "strip_watermark", lambda value: value)
+    downloads = []
+
+    def list_page(_sess, _cat, page, *_dates):
+        return {"content": [
+            {"id": 42, "title": "match 一", "publishTime": "2026-08-01T00:00:00Z"},
+            {"id": 43, "title": "match 二", "publishTime": "2026-08-01T00:00:00Z"},
+        ]} if page == 1 else {"content": []}
+
+    def download(_sess, rid):
+        downloads.append(rid)
+        return b"%PDF-arm"
+
+    monkeypatch.setattr(m, "list_page", list_page)
+    monkeypatch.setattr(m, "viewer_pdf", download)
+    m.main()
+
+    assert downloads == [43]
+    day = staging / "local" / "cicc-research" / "2026" / "08" / "01"
+    assert not (day / "match 一_42.pdf").exists()
+    assert (day / "match 二_43.pdf").exists()
+    out = capsys.readouterr().out
+    assert "lab.sqlite 已入库跳过 1" in out
+    assert "完成：下载 1，已存在跳过 1，失败 0" in out
 
 
 
